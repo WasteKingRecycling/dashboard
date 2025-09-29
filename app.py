@@ -153,6 +153,60 @@ class LiveCall(db.Model):
 with app.app_context():
     db.create_all()
 
+# Cleanup Functions
+def cleanup_old_audio_files():
+    """Delete local audio files older than 2 hours"""
+    try:
+        audio_dir = os.path.join(os.getcwd(), 'audio_files')
+        if not os.path.exists(audio_dir):
+            return
+        
+        two_hours_ago = datetime.utcnow() - timedelta(hours=2)
+        deleted_count = 0
+        
+        for filename in os.listdir(audio_dir):
+            filepath = os.path.join(audio_dir, filename)
+            if os.path.isfile(filepath):
+                file_time = datetime.fromtimestamp(os.path.getmtime(filepath))
+                if file_time < two_hours_ago:
+                    os.remove(filepath)
+                    deleted_count += 1
+                    print(f"Deleted old audio file: {filename}")
+        
+        if deleted_count > 0:
+            print(f"Cleanup: Deleted {deleted_count} audio files older than 2 hours")
+    except Exception as e:
+        print(f"Audio cleanup error: {e}")
+
+def cleanup_old_database_records():
+    """Delete database records older than 3 months"""
+    try:
+        three_months_ago = datetime.utcnow() - timedelta(days=90)
+        
+        # Delete old transcripts
+        old_transcripts = Transcript.query.filter(Transcript.timestamp < three_months_ago).all()
+        for transcript in old_transcripts:
+            db.session.delete(transcript)
+        
+        # Delete old calls
+        old_calls = Call.query.filter(Call.start_time < three_months_ago).all()
+        for call in old_calls:
+            db.session.delete(call)
+        
+        # Delete old live calls
+        old_live_calls = LiveCall.query.filter(LiveCall.start_time < three_months_ago).all()
+        for live_call in old_live_calls:
+            db.session.delete(live_call)
+        
+        db.session.commit()
+        
+        total_deleted = len(old_transcripts) + len(old_calls) + len(old_live_calls)
+        if total_deleted > 0:
+            print(f"Cleanup: Deleted {total_deleted} database records older than 3 months")
+    except Exception as e:
+        db.session.rollback()
+        print(f"Database cleanup error: {e}")
+
 # OpenAI Extraction Function
 def extract_information_with_openai(text, call):
     """Extract information using OpenAI API"""
@@ -402,6 +456,14 @@ def handle_transcription():
 @with_db_retry
 def get_conversations():
     try:
+        # Run cleanup automatically every time conversations are fetched
+        import random
+        if random.randint(1, 10) == 1:  # Run cleanup 10% of the time
+            cleanup_old_audio_files()
+        
+        if random.randint(1, 100) == 1:  # Run database cleanup 1% of the time
+            cleanup_old_database_records()
+        
         two_hours_ago = datetime.utcnow() - timedelta(hours=2)
         calls = Call.query.filter(Call.start_time >= two_hours_ago).order_by(Call.start_time.desc()).all()
         return jsonify({'calls': [call.to_dict() for call in calls]})
@@ -594,6 +656,55 @@ def get_call_audio(call_id):
             return jsonify({'success': False, 'message': 'No audio available'}), 404
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/cleanup/audio', methods=['POST'])
+def cleanup_audio_endpoint():
+    """Manual trigger for audio file cleanup"""
+    cleanup_old_audio_files()
+    return jsonify({'success': True, 'message': 'Audio files cleanup completed'})
+
+@app.route('/api/cleanup/database', methods=['POST'])
+def cleanup_database_endpoint():
+    """Manual trigger for database cleanup"""
+    cleanup_old_database_records()
+    return jsonify({'success': True, 'message': 'Database cleanup completed'})
+
+@app.route('/api/cleanup/all', methods=['POST'])
+def cleanup_all_endpoint():
+    """Manual trigger for all cleanup tasks"""
+    cleanup_old_audio_files()
+    cleanup_old_database_records()
+    return jsonify({'success': True, 'message': 'All cleanup tasks completed'})
+
+@app.route('/api/stats')
+@with_db_retry
+def get_stats():
+    """Get statistics about calls"""
+    try:
+        total_calls = Call.query.count()
+        today_calls = Call.query.filter(
+            db.func.date(Call.start_time) == datetime.today().date()
+        ).count()
+        
+        stats = {
+            'total_calls': total_calls,
+            'today_calls': today_calls,
+            'skip_bookings': Call.query.filter_by(booking_confirmed=True).count(),
+            'callbacks': Call.query.filter_by(callback_requested=True).count(),
+            'trade_customers': Call.query.filter_by(trade_customer=True).count(),
+            'active_calls': Call.query.filter_by(status='active').count()
+        }
+        return jsonify(stats)
+    except Exception as e:
+        print(f"Error fetching stats: {e}")
+        return jsonify({
+            'total_calls': 0,
+            'today_calls': 0,
+            'skip_bookings': 0,
+            'callbacks': 0,
+            'trade_customers': 0,
+            'active_calls': 0
+        })
 
 # DASHBOARD 1: Main Dashboard - / route
 @app.route('/')
@@ -1086,9 +1197,16 @@ def dashboard():
     ''')
 
 if __name__ == '__main__':
+    # Run cleanup on startup
+    print("Running cleanup on startup...")
+    cleanup_old_audio_files()
+    cleanup_old_database_records()
+    
     port = int(os.environ.get('PORT', 8000))
     print(f"Server running on port {port}")
     print(f"Main Dashboard: http://localhost:{port}/")
     print(f"Full Dashboard: http://localhost:{port}/dashboard")
     print("Features: OpenAI extraction, Audio download, Team notes, Search, Live call tracking")
+    print("Cleanup: Audio files > 2 hours, Database records > 3 months")
+    print("Manual cleanup endpoints: POST /api/cleanup/audio, /api/cleanup/database, /api/cleanup/all")
     app.run(host='0.0.0.0', port=port)
