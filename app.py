@@ -174,7 +174,6 @@ with app.app_context():
 
 # Cleanup Functions
 def cleanup_old_audio_files():
-    """Delete local audio files older than 2 hours"""
     try:
         audio_dir = os.path.join(os.getcwd(), 'audio_files')
         if not os.path.exists(audio_dir):
@@ -192,12 +191,11 @@ def cleanup_old_audio_files():
                     deleted_count += 1
         
         if deleted_count > 0:
-            print(f"Cleanup: Deleted {deleted_count} audio files older than 2 hours")
+            print(f"Cleanup: Deleted {deleted_count} audio files")
     except Exception as e:
         print(f"Audio cleanup error: {e}")
 
 def cleanup_old_database_records():
-    """Delete database records older than 3 months"""
     try:
         three_months_ago = datetime.utcnow() - timedelta(days=90)
         
@@ -217,14 +215,13 @@ def cleanup_old_database_records():
         
         total_deleted = len(old_transcripts) + len(old_calls) + len(old_live_calls)
         if total_deleted > 0:
-            print(f"Cleanup: Deleted {total_deleted} database records older than 3 months")
+            print(f"Cleanup: Deleted {total_deleted} old records")
     except Exception as e:
         db.session.rollback()
         print(f"Database cleanup error: {e}")
 
-# OpenAI Extraction Function
+# OpenAI Extraction
 def extract_information_with_openai(text, call):
-    """Extract information using OpenAI API"""
     if not OPENAI_API_KEY:
         return False
         
@@ -238,21 +235,15 @@ def extract_information_with_openai(text, call):
     ]
     context_messages.append({"role": "user", "content": text})
 
-    prompt = """You are an expert data extraction bot for a waste management company. Extract key details from this conversation.
+    prompt = """Extract key details from this waste management call.
 
 Conversation:
 {conversation_context}
 
-Rules for Service Classification:
-1. If mentions "skip" → Service is "Skip Hire"
-2. If mentions "man and van" or "clearance" without "skip" → Service is "Man & Van"  
-3. If mentions "grab" → Service is "Grab Hire"
-4. If mentions "RORO" → Service is "RORO"
-
-Other Rules:
-- Customer name: Full name of person
-- Postcode: Valid UK postcode with space (e.g., "LS14 8AB")
-- Service: Must be one of: "Skip Hire", "Man & Van", "Grab Hire", "RORO", "Toilet Hire", "Wheelie Bins", "Waste Bags"
+Rules:
+- If mentions "skip" → Service is "Skip Hire"
+- If mentions "man and van" or "clearance" without "skip" → Service is "Man & Van"  
+- If mentions "grab" → Service is "Grab Hire"
 
 Return JSON:
 {{"customer_name": "", "postcode": "", "service": "", "trade_customer": null, "skip_size": null, "waste_type": "", "callback_requested": null, "when_needed": ""}}
@@ -289,7 +280,6 @@ Return JSON:
                     if current_value is None or current_value == "":
                         setattr(call, field, value)
                         updated = True
-                        print(f"OpenAI EXTRACTED {field}: {value}")
             
             return updated
         return False
@@ -299,7 +289,6 @@ Return JSON:
         return False
 
 def download_twilio_audio(audio_url, recording_sid):
-    """Download audio file from Twilio and save locally"""
     try:
         audio_dir = os.path.join(os.getcwd(), 'audio_files')
         os.makedirs(audio_dir, exist_ok=True)
@@ -330,15 +319,12 @@ def download_twilio_audio(audio_url, recording_sid):
         else:
             return {
                 'success': False,
-                'message': f'Failed to download audio: {response.status_code}'
+                'message': f'Failed: {response.status_code}'
             }
             
     except Exception as e:
         print(f"Audio download error: {e}")
-        return {
-            'success': False,
-            'message': str(e)
-        }
+        return {'success': False, 'message': str(e)}
 
 # TWILIO ROUTES
 @app.route('/voice/incoming', methods=['POST', 'GET'])
@@ -395,13 +381,22 @@ def handle_recording():
     try:
         call = Call.query.filter_by(call_sid=call_sid).first()
         if call:
+            # Convert to public media URL (no authentication required)
+            if recording_url:
+                # Remove .json extension and add .mp3
+                if '.json' in recording_url:
+                    recording_url = recording_url.replace('.json', '')
+                if not recording_url.endswith('.mp3'):
+                    recording_url = recording_url + '.mp3'
+            
             call.recording_url = recording_url
             call.recording_sid = recording_sid
             call.recording_duration = int(recording_duration)
             call.audio_status = 'available'
             db.session.commit()
-            print(f"Recording saved for call {call_sid}")
-    except:
+            print(f"Recording saved: {recording_url}")
+    except Exception as e:
+        print(f"Recording save error: {e}")
         db.session.rollback()
     
     return "OK", 200
@@ -583,7 +578,7 @@ def update_team_notes():
         
         return jsonify({
             'success': True, 
-            'message': 'Team notes updated successfully',
+            'message': 'Team notes updated',
             'team_notes': team_notes
         })
     except Exception as e:
@@ -614,7 +609,7 @@ def update_call_status():
         
         return jsonify({
             'success': True,
-            'message': f'Call status updated to {new_status}',
+            'message': f'Status updated to {new_status}',
             'status': new_status
         })
     except Exception as e:
@@ -638,7 +633,7 @@ def download_audio(call_id):
             
             return jsonify({
                 'success': True,
-                'message': 'Audio downloaded successfully',
+                'message': 'Audio downloaded',
                 'local_path': audio_response['local_path']
             })
         else:
@@ -666,22 +661,6 @@ def get_call_audio(call_id):
             return jsonify({'success': False, 'message': 'No audio available'}), 404
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
-
-@app.route('/api/cleanup/audio', methods=['POST'])
-def cleanup_audio_endpoint():
-    cleanup_old_audio_files()
-    return jsonify({'success': True, 'message': 'Audio files cleanup completed'})
-
-@app.route('/api/cleanup/database', methods=['POST'])
-def cleanup_database_endpoint():
-    cleanup_old_database_records()
-    return jsonify({'success': True, 'message': 'Database cleanup completed'})
-
-@app.route('/api/cleanup/all', methods=['POST'])
-def cleanup_all_endpoint():
-    cleanup_old_audio_files()
-    cleanup_old_database_records()
-    return jsonify({'success': True, 'message': 'All cleanup tasks completed'})
 
 @app.route('/api/stats')
 @with_db_retry
@@ -712,7 +691,7 @@ def get_stats():
             'active_calls': 0
         })
 
-# DASHBOARD 1: Main Dashboard - / route (FROM FIRST CODE WITH ALL DETAILS)
+# DASHBOARD 1: Main Dashboard - / route
 @app.route('/')
 def index():
     try:
@@ -1033,9 +1012,9 @@ def index():
                     </div>
                     {% else %}
                     <div class="audio-controls">
-                        <strong>📞 Call Recording</strong>
+                        <strong>Call Recording</strong>
                         <div style="margin-top: 10px;">Checking for audio recording...</div>
-                        <button class="audio-btn" onclick="event.stopPropagation(); tryLoadAudio({{ call.id }})">🔍 Try Load Audio</button>
+                        <button class="audio-btn" onclick="event.stopPropagation(); tryLoadAudio({{ call.id }})">Try Load Audio</button>
                     </div>
                     {% endif %}
                     
@@ -1074,7 +1053,6 @@ def index():
             const callGroup = document.querySelector(`[data-call-id="${callId}"]`);
             callGroup.classList.toggle('expanded');
             
-            // Load transcript preview
             const call = calls.find(c => c.id === callId);
             if (call && call.transcript) {
                 const previewEl = document.getElementById(`transcript-preview-${callId}`);
@@ -1251,7 +1229,7 @@ def index():
 </html>
     ''', calls=calls_data)
 
-# DASHBOARD 2: Full Dashboard - /dashboard route (FROM SECOND CODE)
+# DASHBOARD 2: Full Dashboard - /dashboard route
 @app.route('/dashboard')
 def dashboard():
     return render_template_string('''
@@ -1460,6 +1438,6 @@ if __name__ == '__main__':
     print(f"Server running on port {port}")
     print(f"Main Dashboard: http://localhost:{port}/")
     print(f"Full Dashboard: http://localhost:{port}/dashboard")
-    print("Features: OpenAI extraction, Audio download, Team notes, Search, Live call tracking")
-    print("Cleanup: Audio files > 2 hours, Database records > 3 months")
+    print("✓ Audio: Public URLs (no auth required)")
+    print("✓ Cleanup: Audio > 2hrs, DB > 3 months")
     app.run(host='0.0.0.0', port=port)
