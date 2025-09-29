@@ -1,24 +1,15 @@
-"""
-WasteKing Voice Agent - Two Dashboards + Live Audio
-Dashboard 1: Simple table with side panel (from document 1)
-Dashboard 2: Expandable rows with full features (from document 3)
-"""
-
 from flask import Flask, request, jsonify, render_template_string, send_file
 from flask_sqlalchemy import SQLAlchemy
 from twilio.twiml.voice_response import VoiceResponse, Start, Dial
-from twilio.rest import Client
 import os
 import json
 import requests
-import re
 from datetime import datetime, timedelta
-from pytz import timezone
+from functools import wraps
 
 app = Flask(__name__)
 
-# Configuration
-DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://localhost/wasteking_voice')
+DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://koyeb-adm:npg_19AiOJgmEZYB@ep-jolly-night-a23g0dl0.eu-central-1.pg.koyeb.app/koyebdb')
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 
@@ -28,113 +19,106 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'pool_size': 10,
     'pool_recycle': 280,
     'pool_pre_ping': True,
+    'pool_timeout': 30,
+    'max_overflow': 20
 }
 
 db = SQLAlchemy(app)
 
-# Environment Variables
 ELEVENLABS_PHONE_NUMBER = os.environ.get('ELEVENLABS_PHONE_NUMBER', '+447366432353')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
-TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
-TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
+TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', 'your_twilio_sid')
+TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN', 'your_twilio_token')
 
-# UK Timezone
-UK_TZ = timezone('Europe/London')
+# Database retry decorator
+def with_db_retry(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                if 'SSL connection' in str(e) or 'server closed' in str(e):
+                    print(f"DB connection lost (attempt {attempt + 1}/{max_retries})")
+                    db.session.rollback()
+                    db.session.remove()
+                    db.engine.dispose()
+                    if attempt < max_retries - 1:
+                        continue
+                raise e
+        return func(*args, **kwargs)
+    return wrapper
 
 # Database Models
 class Call(db.Model):
     __tablename__ = 'calls'
     
     id = db.Column(db.Integer, primary_key=True)
-    unique_call_id = db.Column(db.String(20), unique=True, nullable=False, index=True)
     call_sid = db.Column(db.String(100), unique=True, nullable=False, index=True)
     from_number = db.Column(db.String(50))
     start_time = db.Column(db.DateTime, default=datetime.utcnow)
     status = db.Column(db.String(20), default='active')
     
-    # Customer Info
     customer_name = db.Column(db.String(100))
     postcode = db.Column(db.String(20))
     service = db.Column(db.String(200))
     customer_address = db.Column(db.Text)
     customer_email = db.Column(db.String(100))
-    
-    # Call Details
     callback_requested = db.Column(db.Boolean, default=False)
     trade_customer = db.Column(db.Boolean, default=False)
-    complaint = db.Column(db.Boolean, default=False)
-    quote_provided = db.Column(db.Boolean, default=False)
-    booking_confirmed = db.Column(db.Boolean, default=False)
-    payment_link_sent = db.Column(db.Boolean, default=False)
-    
-    # Status Fields
-    call_status = db.Column(db.String(50), default='completed')
-    
-    # Service Specific
-    skip_size = db.Column(db.String(50))
-    waste_type = db.Column(db.String(200))
     when_needed = db.Column(db.String(100))
     
-    # Notes
+    # Recording fields
+    recording_url = db.Column(db.String(500))
+    recording_sid = db.Column(db.String(100))
+    recording_duration = db.Column(db.Integer, default=0)
+    local_audio_path = db.Column(db.String(300))
+    audio_status = db.Column(db.String(50), default='pending')
+    
+    # Team notes
     team_notes = db.Column(db.Text)
     
-    # Recording
-    recording_sid = db.Column(db.String(100))
-    recording_url = db.Column(db.String(500))
-    recording_duration = db.Column(db.Integer, default=0)
+    skip_size = db.Column(db.String(50))
+    waste_type = db.Column(db.String(200))
+    placement_location = db.Column(db.String(100))
+    delivery_date = db.Column(db.String(100))
+    time_preference = db.Column(db.String(20))
+    skip_price = db.Column(db.String(50))
+    booking_confirmed = db.Column(db.Boolean, default=False)
     
-    # Live Audio
-    live_audio_url = db.Column(db.String(500))
+    yards_requested = db.Column(db.String(50))
+    supplements = db.Column(db.String(200))
+    stairs_access = db.Column(db.String(50))
+    
+    grab_size = db.Column(db.String(50))
+    material_type = db.Column(db.String(100))
+    roadside_reach = db.Column(db.Boolean, default=True)
     
     transcripts = db.relationship('Transcript', backref='call', lazy=True, cascade='all, delete-orphan')
     
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        if not self.unique_call_id:
-            import random
-            timestamp = datetime.now().strftime('%y%m%d%H%M')
-            suffix = str(random.randint(100, 999))
-            self.unique_call_id = f"WK{timestamp}{suffix}"
-    
-    def get_uk_time(self):
-        if self.start_time:
-            utc_time = self.start_time.replace(tzinfo=timezone('UTC'))
-            return utc_time.astimezone(UK_TZ)
-        return None
-    
     def to_dict(self):
-        uk_time = self.get_uk_time()
         return {
             'id': self.id,
-            'unique_call_id': self.unique_call_id,
             'call_sid': self.call_sid,
             'from': self.from_number,
-            'start_time': uk_time.isoformat() if uk_time else None,
-            'time': uk_time.strftime('%H:%M') if uk_time else None,
-            'date': uk_time.strftime('%d/%m/%Y') if uk_time else None,
-            'datetime': uk_time.strftime('%d/%m/%Y %H:%M:%S') if uk_time else None,
+            'start_time': self.start_time.isoformat() if self.start_time else None,
             'status': self.status,
-            'call_status': self.call_status,
+            'transcript_count': len(self.transcripts),
             'customer_name': self.customer_name,
             'postcode': self.postcode,
             'service': self.service,
-            'customer_address': self.customer_address,
-            'customer_email': self.customer_email,
-            'callback_requested': self.callback_requested,
             'trade_customer': self.trade_customer,
-            'complaint': self.complaint,
-            'quote_provided': self.quote_provided,
-            'booking_confirmed': self.booking_confirmed,
-            'payment_link_sent': self.payment_link_sent,
-            'skip_size': self.skip_size,
-            'waste_type': self.waste_type,
+            'callback_requested': self.callback_requested,
             'when_needed': self.when_needed,
-            'team_notes': self.team_notes or '',
-            'transcript_count': len(self.transcripts),
-            'has_recording': bool(self.recording_url),
             'recording_url': self.recording_url,
             'recording_duration': self.recording_duration,
-            'live_audio_url': self.live_audio_url
+            'local_audio_path': self.local_audio_path,
+            'audio_status': self.audio_status,
+            'team_notes': self.team_notes,
+            'skip_size': self.skip_size,
+            'waste_type': self.waste_type,
+            'booking_confirmed': self.booking_confirmed,
         }
 
 class Transcript(db.Model):
@@ -146,56 +130,67 @@ class Transcript(db.Model):
     text = db.Column(db.Text)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
     
-    def get_uk_time(self):
-        if self.timestamp:
-            utc_time = self.timestamp.replace(tzinfo=timezone('UTC'))
-            return utc_time.astimezone(UK_TZ)
-        return None
-    
     def to_dict(self):
-        uk_time = self.get_uk_time()
         return {
             'speaker': self.speaker,
             'text': self.text,
-            'timestamp': uk_time.isoformat() if uk_time else None,
-            'time': uk_time.strftime('%H:%M:%S') if uk_time else None
+            'timestamp': self.timestamp.isoformat() if self.timestamp else None,
+            'time': self.timestamp.strftime('%H:%M:%S') if self.timestamp else None
         }
 
-# Create tables
+class LiveCall(db.Model):
+    __tablename__ = 'live_calls'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    call_sid = db.Column(db.String(150), unique=True)
+    customer_name = db.Column(db.String(100), default='Unknown')
+    phone = db.Column(db.String(20), default='Unknown')
+    postcode = db.Column(db.String(10), default='Unknown')
+    status = db.Column(db.String(50), default='connecting')
+    start_time = db.Column(db.DateTime, default=datetime.utcnow)
+    last_update = db.Column(db.DateTime, default=datetime.utcnow)
+
 with app.app_context():
     db.create_all()
-    print("Database tables created")
 
-# OpenAI Extraction
-def extract_with_openai(text, call):
+# OpenAI Extraction Function
+def extract_information_with_openai(text, call):
+    """Extract information using OpenAI API"""
     if not OPENAI_API_KEY:
         return False
-    
-    recent = db.session.query(Transcript.speaker, Transcript.text).filter(
+        
+    recent_transcripts = db.session.query(Transcript.speaker, Transcript.text).filter(
         Transcript.call_sid == call.call_sid
     ).order_by(Transcript.timestamp.desc()).limit(5).all()
-    
-    context = [{"role": "user" if t.speaker == 'CUSTOMER' else "assistant", "content": t.text} for t in reversed(recent)]
-    context.append({"role": "user", "content": text})
-    
-    conversation_str = "\n".join([f"{msg['role'].upper()}: {msg['content']}" for msg in context])
-    
-    prompt = f"""Extract information from this WasteKing call. Return JSON only.
+
+    context_messages = [
+        {"role": "user" if t.speaker == 'CUSTOMER' else "assistant", "content": t.text}
+        for t in reversed(recent_transcripts)
+    ]
+    context_messages.append({"role": "user", "content": text})
+
+    prompt = """You are an expert data extraction bot for a waste management company. Extract key details from this conversation.
 
 Conversation:
-{conversation_str}
+{conversation_context}
 
-Extract EXACTLY:
-- customer_name: Full name
-- postcode: UK postcode with space
-- service: One of: "Skip Hire", "Man & Van", "Grab Hire", "RORO"
-- trade_customer: true/false
-- callback_requested: true/false
+Rules for Service Classification:
+1. If mentions "skip" → Service is "Skip Hire"
+2. If mentions "man and van" or "clearance" without "skip" → Service is "Man & Van"  
+3. If mentions "grab" → Service is "Grab Hire"
+4. If mentions "RORO" → Service is "RORO"
+
+Other Rules:
+- Customer name: Full name of person
+- Postcode: Valid UK postcode with space (e.g., "LS14 8AB")
+- Service: Must be one of: "Skip Hire", "Man & Van", "Grab Hire", "RORO", "Toilet Hire", "Wheelie Bins", "Waste Bags"
 
 Return JSON:
-{{"customer_name": "", "postcode": "", "service": "", "trade_customer": false, "callback_requested": false}}
+{{"customer_name": "", "postcode": "", "service": "", "trade_customer": null, "skip_size": null, "waste_type": "", "callback_requested": null, "when_needed": ""}}
 """
     
+    conversation_context_str = "\n".join([f"{msg['role'].upper()}: {msg['content']}" for msg in context_messages])
+
     try:
         response = requests.post(
             "https://api.openai.com/v1/chat/completions",
@@ -205,7 +200,7 @@ Return JSON:
             },
             json={
                 "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [{"role": "user", "content": prompt.format(conversation_context=conversation_context_str)}],
                 "max_tokens": 250,
                 "temperature": 0.1,
                 "response_format": {"type": "json_object"}
@@ -215,24 +210,70 @@ Return JSON:
         
         if response.status_code == 200:
             result = response.json()
-            extracted = json.loads(result['choices'][0]['message']['content'])
-            
+            extracted_text = result['choices'][0]['message']['content'].strip()
+            extracted_data = json.loads(extracted_text)
             updated = False
-            for field, value in extracted.items():
-                if hasattr(call, field) and value and value != "":
-                    current = getattr(call, field)
-                    if not current or current == "":
+            
+            for field, value in extracted_data.items():
+                if hasattr(call, field) and value is not None and value != "":
+                    current_value = getattr(call, field)
+                    if current_value is None or current_value == "":
                         setattr(call, field, value)
                         updated = True
+                        print(f"OpenAI EXTRACTED {field}: {value}")
             
             return updated
+        return False
+            
     except Exception as e:
-        print(f"OpenAI error: {e}")
-    
-    return False
+        print(f"OpenAI extraction error: {e}")
+        return False
 
-# Twilio Routes
+def download_twilio_audio(audio_url, recording_sid):
+    """Download audio file from Twilio and save locally"""
+    try:
+        audio_dir = os.path.join(os.getcwd(), 'audio_files')
+        os.makedirs(audio_dir, exist_ok=True)
+        
+        headers = {}
+        if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_ACCOUNT_SID != 'your_twilio_sid':
+            import base64
+            credentials = base64.b64encode(f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode()).decode()
+            headers['Authorization'] = f'Basic {credentials}'
+        
+        response = requests.get(audio_url, headers=headers, stream=True)
+        
+        if response.status_code == 200:
+            filename = f"{recording_sid}.mp3"
+            local_path = os.path.join(audio_dir, filename)
+            
+            with open(local_path, 'wb') as audio_file:
+                for chunk in response.iter_content(chunk_size=8192):
+                    audio_file.write(chunk)
+            
+            file_size = os.path.getsize(local_path)
+            
+            return {
+                'success': True,
+                'local_path': local_path,
+                'file_size': file_size
+            }
+        else:
+            return {
+                'success': False,
+                'message': f'Failed to download audio: {response.status_code}'
+            }
+            
+    except Exception as e:
+        print(f"Audio download error: {e}")
+        return {
+            'success': False,
+            'message': str(e)
+        }
+
+# TWILIO ROUTES
 @app.route('/voice/incoming', methods=['POST', 'GET'])
+@with_db_retry
 def handle_incoming_call():
     call_sid = request.form.get('CallSid')
     from_number = request.form.get('From')
@@ -243,13 +284,19 @@ def handle_incoming_call():
             call = Call(call_sid=call_sid, from_number=from_number, status='active')
             db.session.add(call)
             db.session.commit()
-    except Exception as e:
+            
+        # Track as live call
+        live_call = LiveCall.query.filter_by(call_sid=call_sid).first()
+        if not live_call:
+            live_call = LiveCall(call_sid=call_sid, phone=from_number, status='connecting')
+            db.session.add(live_call)
+            db.session.commit()
+    except:
         db.session.rollback()
-    
+
     response = VoiceResponse()
-    
     start = Start()
-    transcription = start.transcription(
+    start.transcription(
         statusCallbackUrl=f'https://{request.host}/voice/transcription',
         track='both_tracks',
         partialResults=True,
@@ -260,38 +307,39 @@ def handle_incoming_call():
     
     dial = Dial(
         timeout=30,
-        hangupOnStar=False,
         record='record-from-answer',
-        recordingStatusCallback=f'https://{request.host}/voice/recording-callback',
-        recordingStatusCallbackMethod='POST'
+        recordingStatusCallback=f'https://{request.host}/voice/recording',
+        recordingStatusCallbackEvent='completed'
     )
     dial.number(ELEVENLABS_PHONE_NUMBER)
     response.append(dial)
     
-    response.say("Sorry, we're unable to connect you at the moment.", voice='alice')
-    
     return str(response)
 
-@app.route('/voice/recording-callback', methods=['POST'])
-def recording_callback():
+@app.route('/voice/recording', methods=['POST'])
+@with_db_retry
+def handle_recording():
     call_sid = request.form.get('CallSid')
-    recording_sid = request.form.get('RecordingSid')
     recording_url = request.form.get('RecordingUrl')
+    recording_sid = request.form.get('RecordingSid')
     recording_duration = request.form.get('RecordingDuration', 0)
     
     try:
         call = Call.query.filter_by(call_sid=call_sid).first()
         if call:
+            call.recording_url = recording_url
             call.recording_sid = recording_sid
-            call.recording_url = f"{recording_url}.mp3"
             call.recording_duration = int(recording_duration)
+            call.audio_status = 'available'
             db.session.commit()
-    except Exception as e:
+            print(f"Recording saved for call {call_sid}")
+    except:
         db.session.rollback()
     
     return "OK", 200
 
-@app.route('/voice/transcription', methods=['POST'])
+@app.route('/voice/transcription', methods=['POST', 'GET'])
+@with_db_retry
 def handle_transcription():
     call_sid = request.form.get('CallSid')
     event = request.form.get('TranscriptionEvent')
@@ -316,11 +364,22 @@ def handle_transcription():
                     transcript = Transcript(call_sid=call_sid, speaker=speaker, text=text)
                     db.session.add(transcript)
                     
+                    # Extract info from customer messages
                     if speaker == 'CUSTOMER':
-                        extract_with_openai(text, call)
+                        extract_information_with_openai(text, call)
+                    
+                    # Update live call
+                    live_call = LiveCall.query.filter_by(call_sid=call_sid).first()
+                    if live_call:
+                        live_call.status = 'in_progress'
+                        live_call.last_update = datetime.utcnow()
+                        if call.customer_name:
+                            live_call.customer_name = call.customer_name
+                        if call.postcode:
+                            live_call.postcode = call.postcode
                     
                     db.session.commit()
-            except Exception as e:
+            except:
                 db.session.rollback()
     
     elif event == 'transcription-stopped':
@@ -328,43 +387,120 @@ def handle_transcription():
             call = Call.query.filter_by(call_sid=call_sid).first()
             if call:
                 call.status = 'ended'
-                db.session.commit()
-        except Exception as e:
+            
+            live_call = LiveCall.query.filter_by(call_sid=call_sid).first()
+            if live_call:
+                live_call.status = 'completed'
+            
+            db.session.commit()
+        except:
             db.session.rollback()
-    
+            
     return "OK", 200
 
-# API Routes
 @app.route('/api/conversations')
+@with_db_retry
 def get_conversations():
     try:
-        calls = Call.query.order_by(Call.start_time.desc()).limit(100).all()
+        two_hours_ago = datetime.utcnow() - timedelta(hours=2)
+        calls = Call.query.filter(Call.start_time >= two_hours_ago).order_by(Call.start_time.desc()).all()
         return jsonify({'calls': [call.to_dict() for call in calls]})
-    except Exception as e:
+    except:
         return jsonify({'calls': []}), 500
 
 @app.route('/api/conversations/<call_sid>')
+@with_db_retry
 def get_conversation(call_sid):
     try:
         call = Call.query.filter_by(call_sid=call_sid).first()
+        
         if not call:
-            return jsonify({'error': 'Call not found'}), 404
+            return jsonify({
+                'call_sid': call_sid,
+                'call_info': {'from': 'Unknown', 'start_time': datetime.now().isoformat(), 'status': 'unknown'},
+                'transcripts': []
+            })
         
         transcripts = Transcript.query.filter_by(call_sid=call_sid).order_by(Transcript.timestamp).all()
         
         return jsonify({
+            'call_sid': call_sid,
             'call_info': call.to_dict(),
             'transcripts': [t.to_dict() for t in transcripts]
         })
+    except:
+        return jsonify({
+            'call_sid': call_sid,
+            'call_info': None,
+            'transcripts': []
+        }), 500
+
+@app.route('/api/live-calls')
+@with_db_retry
+def get_live_calls():
+    try:
+        # Clean old calls
+        old_calls = LiveCall.query.filter(
+            LiveCall.last_update < datetime.utcnow() - timedelta(hours=1)
+        ).all()
+        for old_call in old_calls:
+            db.session.delete(old_call)
+        db.session.commit()
+        
+        live_calls = LiveCall.query.filter(
+            LiveCall.status != 'completed'
+        ).order_by(LiveCall.start_time.desc()).all()
+        
+        calls_data = []
+        for call in live_calls:
+            calls_data.append({
+                'call_sid': call.call_sid,
+                'customer_name': call.customer_name,
+                'phone': call.phone,
+                'postcode': call.postcode,
+                'status': call.status,
+                'start_time': call.start_time.isoformat(),
+                'duration': int((datetime.utcnow() - call.start_time).total_seconds())
+            })
+        
+        return jsonify({'success': True, 'live_calls': calls_data, 'count': len(calls_data)})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/search-calls')
+@with_db_retry
+def search_calls():
+    try:
+        query = request.args.get('q', '').strip()
+        if not query:
+            return jsonify({'success': False, 'message': 'Search query required'}), 400
+        
+        calls = Call.query.filter(
+            db.or_(
+                Call.customer_name.ilike(f'%{query}%'),
+                Call.from_number.like(f'%{query}%'),
+                Call.postcode.ilike(f'%{query}%'),
+                Call.call_sid.ilike(f'%{query}%'),
+                Call.customer_email.ilike(f'%{query}%')
+            )
+        ).order_by(Call.start_time.desc()).limit(50).all()
+        
+        calls_data = [call.to_dict() for call in calls]
+        
+        return jsonify({'success': True, 'calls': calls_data, 'count': len(calls_data)})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
 
 @app.route('/api/update-team-notes', methods=['POST'])
+@with_db_retry
 def update_team_notes():
     try:
-        data = request.json
+        data = request.get_json()
         call_id = data.get('call_id')
         team_notes = data.get('team_notes', '').strip()
+        
+        if not call_id:
+            return jsonify({'success': False, 'message': 'Call ID required'}), 400
         
         call = Call.query.get(call_id)
         if not call:
@@ -373,19 +509,27 @@ def update_team_notes():
         call.team_notes = team_notes
         db.session.commit()
         
-        return jsonify({'success': True, 'team_notes': team_notes})
+        return jsonify({
+            'success': True, 
+            'message': 'Team notes updated successfully',
+            'team_notes': team_notes
+        })
     except Exception as e:
         db.session.rollback()
         return jsonify({'success': False, 'message': str(e)}), 500
 
-@app.route('/api/update-status', methods=['POST'])
-def update_status():
+@app.route('/api/update-call-status', methods=['POST'])
+@with_db_retry
+def update_call_status():
     try:
-        data = request.json
+        data = request.get_json()
         call_id = data.get('call_id')
         new_status = data.get('status')
         
-        valid_statuses = ['completed', 'live_call_agent', 'live_call_team', 'ticket_raised']
+        if not call_id or not new_status:
+            return jsonify({'success': False, 'message': 'Call ID and status required'}), 400
+        
+        valid_statuses = ['active', 'ended', 'completed', 'callback']
         if new_status not in valid_statuses:
             return jsonify({'success': False, 'message': 'Invalid status'}), 400
         
@@ -393,34 +537,57 @@ def update_status():
         if not call:
             return jsonify({'success': False, 'message': 'Call not found'}), 404
         
-        call.call_status = new_status
+        call.status = new_status
         db.session.commit()
         
-        return jsonify({'success': True, 'status': new_status})
+        return jsonify({
+            'success': True,
+            'message': f'Call status updated to {new_status}',
+            'status': new_status
+        })
     except Exception as e:
         db.session.rollback()
         return jsonify({'success': False, 'message': str(e)}), 500
 
+@app.route('/api/download-audio/<int:call_id>', methods=['POST'])
+@with_db_retry
+def download_audio(call_id):
+    try:
+        call = Call.query.get(call_id)
+        if not call or not call.recording_url:
+            return jsonify({'success': False, 'message': 'Audio not available'}), 404
+        
+        audio_response = download_twilio_audio(call.recording_url, call.recording_sid)
+        
+        if audio_response['success']:
+            call.local_audio_path = audio_response['local_path']
+            call.audio_status = 'downloaded'
+            db.session.commit()
+            
+            return jsonify({
+                'success': True,
+                'message': 'Audio downloaded successfully',
+                'local_path': audio_response['local_path']
+            })
+        else:
+            return jsonify({'success': False, 'message': audio_response['message']}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
 @app.route('/api/audio/<int:call_id>')
-def get_audio(call_id):
+@with_db_retry
+def get_call_audio(call_id):
     try:
         call = Call.query.get(call_id)
         if not call:
             return jsonify({'success': False, 'message': 'Call not found'}), 404
         
-        # Return live audio if call is active, otherwise recorded audio
-        if call.status == 'active' and call.live_audio_url:
-            return jsonify({
-                'success': True,
-                'audio_url': call.live_audio_url,
-                'is_live': True,
-                'duration': 0
-            })
+        if call.local_audio_path and os.path.exists(call.local_audio_path):
+            return send_file(call.local_audio_path, as_attachment=False)
         elif call.recording_url:
             return jsonify({
                 'success': True,
                 'audio_url': call.recording_url,
-                'is_live': False,
                 'duration': call.recording_duration
             })
         else:
@@ -428,1014 +595,500 @@ def get_audio(call_id):
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
-@app.route('/api/stats')
-def get_stats():
-    try:
-        total = Call.query.count()
-        today = Call.query.filter(
-            db.func.date(Call.start_time) == datetime.today().date()
-        ).count()
-        callbacks = Call.query.filter_by(callback_requested=True).count()
-        complaints = Call.query.filter_by(complaint=True).count()
-        
-        return jsonify({
-            'total_calls': total,
-            'today_calls': today,
-            'callbacks': callbacks,
-            'complaints': complaints
-        })
-    except Exception as e:
-        return jsonify({
-            'total_calls': 0,
-            'today_calls': 0,
-            'callbacks': 0,
-            'complaints': 0
-        })
-
-@app.route('/api/search-calls')
-def search_calls():
-    try:
-        query = request.args.get('q', '').strip()
-        if not query:
-            return jsonify({'calls': []}), 400
-        
-        calls = Call.query.filter(
-            db.or_(
-                Call.customer_name.ilike(f'%{query}%'),
-                Call.from_number.like(f'%{query}%'),
-                Call.postcode.ilike(f'%{query}%'),
-                Call.unique_call_id.ilike(f'%{query}%')
-            )
-        ).order_by(Call.start_time.desc()).limit(50).all()
-        
-        return jsonify({'calls': [call.to_dict() for call in calls]})
-    except Exception as e:
-        return jsonify({'calls': []}), 500
-
-# Dashboard Routes
+# DASHBOARD 1: Main Dashboard - / route
 @app.route('/')
-def dashboard_simple():
-    """Simple dashboard with side panel - Image 1"""
-    return render_template_string(DASHBOARD_SIMPLE)
-
-@app.route('/dashboard')
-def dashboard_full():
-    """Full dashboard with expandable rows - Image 2"""
-    return render_template_string(DASHBOARD_FULL)
-
-# Dashboard Templates
-DASHBOARD_SIMPLE = '''
+def index():
+    try:
+        calls = Call.query.order_by(Call.start_time.desc()).limit(100).all()
+        calls_data = [call.to_dict() for call in calls]
+    except:
+        calls_data = []
+    
+    return render_template_string('''
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>WasteKing Voice Agent</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WasteKing Voice - Dashboard</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        body {  
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
             min-height: 100vh;
             padding: 20px;
         }
-        
+        .container { max-width: 1800px; margin: 0 auto; }
         .header {
             background: white;
+            border-radius: 10px;
             padding: 30px;
-            border-radius: 15px;
-            margin-bottom: 25px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+            margin-bottom: 30px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
             position: relative;
         }
-        
-        .header h1 { font-size: 28px; color: #333; margin-bottom: 10px; }
-        .header h2 { font-size: 16px; color: #666; font-weight: normal; }
-        
-        .header-buttons {
-            position: absolute;
-            top: 30px;
-            right: 30px;
-            display: flex;
-            gap: 15px;
-            align-items: center;
-        }
-        
-        .full-dashboard-btn {
-            background: linear-gradient(135deg, #48bb78, #38a169);
-            color: white;
-            padding: 10px 20px;
-            border-radius: 8px;
-            text-decoration: none;
-            font-weight: 600;
-        }
-        
-        .logo-box {
-            width: 50px;
-            height: 50px;
-            background: #e53e3e;
-            border-radius: 8px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            font-weight: 900;
-            font-size: 18px;
-        }
-        
-        .tabs {
-            display: flex;
-            gap: 10px;
-            margin-top: 20px;
-            flex-wrap: wrap;
-        }
-        
-        .tab {
-            padding: 10px 20px;
-            background: #f0f0f0;
-            border: none;
-            border-radius: 20px;
-            cursor: pointer;
-            font-weight: 500;
-            transition: all 0.3s;
-        }
-        
-        .tab.active { background: #e53e3e; color: white; }
-        
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-            margin-bottom: 25px;
-        }
-        
-        .stat-card {
-            background: white;
-            padding: 25px;
-            border-radius: 12px;
-            text-align: center;
-            box-shadow: 0 8px 20px rgba(0,0,0,0.1);
-        }
-        
-        .stat-number { font-size: 36px; font-weight: bold; color: #e53e3e; }
-        .stat-label { font-size: 14px; color: #666; margin-top: 5px; }
-        
-        .table-container {
-            background: white;
-            border-radius: 15px;
-            overflow: hidden;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.15);
-        }
-        
-        .table-header {
-            background: linear-gradient(135deg, #e53e3e, #c53030);
-            color: white;
-            padding: 20px;
-            display: grid;
-            grid-template-columns: 80px 150px 150px 150px 150px 120px 80px 120px;
-            gap: 15px;
-            font-weight: 600;
-            font-size: 12px;
-            text-transform: uppercase;
-        }
-        
-        .table-row {
-            padding: 18px 20px;
-            display: grid;
-            grid-template-columns: 80px 150px 150px 150px 150px 120px 80px 120px;
-            gap: 15px;
-            border-bottom: 1px solid #f0f0f0;
-            cursor: pointer;
-            transition: all 0.2s;
-            align-items: center;
-        }
-        
-        .table-row:hover { background: #fef5f5; }
-        
-        .status-badge {
-            padding: 4px 12px;
-            border-radius: 15px;
-            font-size: 10px;
-            font-weight: bold;
-            text-transform: uppercase;
-            display: inline-block;
-        }
-        
-        .status-ended { background: #f8d7da; color: #721c24; }
-        .status-active { background: #d4edda; color: #155724; }
-        .status-completed { background: #d1ecf1; color: #0c5460; }
-        
-        .btn-details {
-            background: #e53e3e;
-            color: white;
-            padding: 6px 14px;
-            border: none;
-            border-radius: 6px;
-            font-size: 12px;
-            cursor: pointer;
-        }
-        
-        .side-panel {
-            position: fixed;
-            right: -900px;
-            top: 0;
-            width: 900px;
-            height: 100vh;
-            background: white;
-            box-shadow: -10px 0 40px rgba(0,0,0,0.3);
-            transition: right 0.4s ease;
-            z-index: 1000;
-            overflow-y: auto;
-        }
-        
-        .side-panel.open { right: 0; }
-        
-        .panel-header {
-            background: linear-gradient(135deg, #e53e3e, #c53030);
-            color: white;
-            padding: 30px;
-            position: sticky;
-            top: 0;
-            z-index: 10;
-        }
-        
-        .close-btn {
-            position: absolute;
-            top: 25px;
-            right: 30px;
-            background: rgba(255,255,255,0.2);
-            border: none;
-            color: white;
-            font-size: 28px;
-            width: 40px;
-            height: 40px;
-            border-radius: 50%;
-            cursor: pointer;
-        }
-        
-        .panel-content { padding: 30px; }
-        
-        .call-summary-box {
-            background: linear-gradient(135deg, #fff5f5, #ffe5e5);
-            border: 2px solid #e53e3e;
-            border-radius: 15px;
-            padding: 25px;
-            margin-bottom: 25px;
-        }
-        
-        .summary-title {
-            color: #e53e3e;
-            font-size: 18px;
-            font-weight: 700;
-            margin-bottom: 15px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        
-        .summary-grid {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 15px;
-        }
-        
-        .summary-item {
-            background: white;
-            padding: 15px;
-            border-radius: 10px;
-            border-left: 4px solid #e53e3e;
-        }
-        
-        .summary-label {
-            font-size: 12px;
-            font-weight: 600;
-            color: #666;
-            text-transform: uppercase;
-            margin-bottom: 5px;
-        }
-        
-        .summary-value {
-            font-size: 16px;
-            color: #333;
-            font-weight: 600;
-        }
-        
-        .transcript-section {
-            margin-top: 30px;
-        }
-        
-        .section-title {
-            font-size: 18px;
-            font-weight: 700;
-            color: #333;
-            margin-bottom: 15px;
-            padding-bottom: 10px;
-            border-bottom: 2px solid #e53e3e;
-        }
-        
-        .transcript-list {
-            background: #f8f9fa;
-            border-radius: 10px;
-            padding: 20px;
-            max-height: 400px;
-            overflow-y: auto;
-        }
-        
-        .transcript-msg {
-            margin-bottom: 15px;
-            padding: 12px;
-            border-radius: 8px;
-        }
-        
-        .transcript-msg.AI_AGENT {
-            background: #e8f5e8;
-            border-left: 4px solid #4caf50;
-            margin-right: 20px;
-        }
-        
-        .transcript-msg.CUSTOMER {
-            background: #e3f2fd;
-            border-left: 4px solid #2196F3;
-            margin-left: 20px;
-        }
-        
-        .live-audio-indicator {
-            display: inline-block;
-            width: 10px;
-            height: 10px;
-            background: #48bb78;
-            border-radius: 50%;
-            margin-left: 10px;
-            animation: pulse 1.5s infinite;
-        }
-        
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.3; }
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div class="header-buttons">
-            <a href="/dashboard" class="full-dashboard-btn">Full Dashboard →</a>
-            <div class="logo-box">WK</div>
-        </div>
-        
-        <h1>WasteKing Voice Agent</h1>
-        <h2>Full Dashboard</h2>
-        
-        <div class="tabs">
-            <button class="tab active" onclick="filterCalls('all', this)">All Calls</button>
-            <button class="tab" onclick="filterCalls('skip-hire', this)">Skip Hire</button>
-            <button class="tab" onclick="filterCalls('man-van', this)">Man & Van</button>
-            <button class="tab" onclick="filterCalls('trade', this)">Trade</button>
-            <button class="tab" onclick="filterCalls('grab-hire', this)">Grab Hire</button>
-            <button class="tab" onclick="filterCalls('callbacks', this)">Callbacks</button>
-        </div>
-    </div>
-    
-    <div class="stats-grid" id="stats"></div>
-    
-    <div class="table-container">
-        <div class="table-header">
-            <div>TIME</div>
-            <div>CUSTOMER</div>
-            <div>POSTCODE</div>
-            <div>PHONE</div>
-            <div>SERVICE</div>
-            <div>STATUS</div>
-            <div>MSGS</div>
-            <div>ACTIONS</div>
-        </div>
-        <div id="callsTable"></div>
-    </div>
-    
-    <div class="side-panel" id="sidePanel">
-        <div class="panel-header">
-            <button class="close-btn" onclick="closePanel()">&times;</button>
-            <h2>Call Details & Analysis</h2>
-            <p style="opacity: 0.9; margin-top: 8px;">Select a call to view details</p>
-        </div>
-        <div class="panel-content">
-            <div class="call-summary-box">
-                <h3 class="summary-title">📋 Call Summary</h3>
-                <div class="summary-grid">
-                    <div class="summary-item">
-                        <div class="summary-label">Customer Name</div>
-                        <div class="summary-value" id="summaryName">Not provided</div>
-                    </div>
-                    <div class="summary-item">
-                        <div class="summary-label">Phone Number</div>
-                        <div class="summary-value" id="summaryPhone">Unknown</div>
-                    </div>
-                    <div class="summary-item">
-                        <div class="summary-label">Postcode</div>
-                        <div class="summary-value" id="summaryPostcode">Not provided</div>
-                    </div>
-                    <div class="summary-item">
-                        <div class="summary-label">Service Required</div>
-                        <div class="summary-value" id="summaryService">Not identified</div>
-                    </div>
-                    <div class="summary-item">
-                        <div class="summary-label">Customer Type</div>
-                        <div class="summary-value" id="summaryType">Domestic</div>
-                    </div>
-                    <div class="summary-item">
-                        <div class="summary-label">When Needed</div>
-                        <div class="summary-value" id="summaryWhen">Not specified</div>
-                    </div>
-                    <div class="summary-item">
-                        <div class="summary-label">Callback Required</div>
-                        <div class="summary-value" id="summaryCallback">No</div>
-                    </div>
-                    <div class="summary-item">
-                        <div class="summary-label">Call Status</div>
-                        <div class="summary-value" id="summaryStatus">Unknown</div>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="transcript-section">
-                <h3 class="section-title">Full Transcript<span id="liveIndicator"></span></h3>
-                <div class="transcript-list" id="transcriptList">
-                    <div style="text-align: center; color: #666;">No transcript available</div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        let allCalls = [];
-        let currentFilter = 'all';
-        let selectedCallSid = null;
-        let refreshInterval = null;
-        
-        function filterCalls(filter, element) {
-            document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
-            element.classList.add('active');
-            currentFilter = filter;
-            renderTable();
-        }
-        
-        async function loadData() {
-            try {
-                const [callsRes, statsRes] = await Promise.all([
-                    fetch('/api/conversations'),
-                    fetch('/api/stats')
-                ]);
-                
-                const callsData = await callsRes.json();
-                const statsData = await statsRes.json();
-                
-                allCalls = callsData.calls || [];
-                
-                document.getElementById('stats').innerHTML = `
-                    <div class="stat-card">
-                        <div class="stat-number">1</div>
-                        <div class="stat-label">Total Calls</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number">0</div>
-                        <div class="stat-label">Skip Hire Calls</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number">0</div>
-                        <div class="stat-label">Trade Customers</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number">0</div>
-                        <div class="stat-label">Active Calls</div>
-                    </div>
-                `;
-                
-                renderTable();
-                
-                // Refresh panel if open
-                if (selectedCallSid) {
-                    const call = allCalls.find(c => c.call_sid === selectedCallSid);
-                    if (call) {
-                        updatePanelData(call);
-                    }
-                }
-            } catch (error) {
-                console.error('Error:', error);
-            }
-        }
-        
-        function renderTable() {
-            const tbody = document.getElementById('callsTable');
-            
-            let filtered = allCalls;
-            if (currentFilter === 'skip-hire') filtered = allCalls.filter(c => c.service && c.service.includes('Skip Hire'));
-            else if (currentFilter === 'man-van') filtered = allCalls.filter(c => c.service && c.service.includes('Man & Van'));
-            else if (currentFilter === 'trade') filtered = allCalls.filter(c => c.trade_customer);
-            else if (currentFilter === 'grab-hire') filtered = allCalls.filter(c => c.service && c.service.includes('Grab Hire'));
-            else if (currentFilter === 'callbacks') filtered = allCalls.filter(c => c.callback_requested);
-            
-            tbody.innerHTML = '';
-            filtered.forEach(call => {
-                const row = document.createElement('div');
-                row.className = 'table-row';
-                row.onclick = () => openPanel(call.call_sid);
-                
-                row.innerHTML = `
-                    <div>${call.time || '09:01'}</div>
-                    <div><strong>${call.customer_name || 'Unknown'}</strong></div>
-                    <div><strong>${call.postcode || 'Not provided'}</strong></div>
-                    <div>${call.from || '+447823656762'}</div>
-                    <div>${call.service || 'Unknown'}</div>
-                    <div><span class="status-badge status-${call.status}">${call.status.toUpperCase()}</span></div>
-                    <div>${call.transcript_count || 0}</div>
-                    <div><button class="btn-details" onclick="event.stopPropagation(); openPanel('${call.call_sid}')">Details</button></div>
-                `;
-                tbody.appendChild(row);
-            });
-        }
-        
-        async function openPanel(callSid) {
-            selectedCallSid = callSid;
-            const call = allCalls.find(c => c.call_sid === callSid);
-            if (!call) return;
-            
-            updatePanelData(call);
-            
-            // Fetch transcripts
-            try {
-                const response = await fetch(`/api/conversations/${callSid}`);
-                const data = await response.json();
-                
-                const transcriptList = document.getElementById('transcriptList');
-                transcriptList.innerHTML = '';
-                
-                if (data.transcripts && data.transcripts.length > 0) {
-                    data.transcripts.forEach(t => {
-                        const div = document.createElement('div');
-                        div.className = `transcript-msg ${t.speaker}`;
-                        div.innerHTML = `
-                            <strong>${t.speaker}:</strong> ${t.text}
-                            <div style="font-size: 11px; color: #666; margin-top: 5px;">${t.time}</div>
-                        `;
-                        transcriptList.appendChild(div);
-                    });
-                } else {
-                    transcriptList.innerHTML = '<div style="text-align:center;color:#999;">No transcript available</div>';
-                }
-                
-                // Show live indicator if call is active
-                const liveIndicator = document.getElementById('liveIndicator');
-                if (call.status === 'active') {
-                    liveIndicator.innerHTML = '<span class="live-audio-indicator"></span>';
-                } else {
-                    liveIndicator.innerHTML = '';
-                }
-            } catch (error) {
-                console.error('Transcript error:', error);
-            }
-            
-            document.getElementById('sidePanel').classList.add('open');
-            
-            // Start refresh if call is active
-            if (call.status === 'active' && !refreshInterval) {
-                refreshInterval = setInterval(() => loadData(), 3000);
-            }
-        }
-        
-        function updatePanelData(call) {
-            document.getElementById('summaryName').textContent = call.customer_name || 'Not provided';
-            document.getElementById('summaryPhone').textContent = call.from || 'Unknown';
-            document.getElementById('summaryPostcode').textContent = call.postcode || 'Not provided';
-            document.getElementById('summaryService').textContent = call.service || 'Not identified';
-            document.getElementById('summaryType').textContent = call.trade_customer ? 'Trade' : 'Domestic';
-            document.getElementById('summaryWhen').textContent = call.when_needed || 'Not specified';
-            document.getElementById('summaryCallback').textContent = call.callback_requested ? 'Yes' : 'No';
-            document.getElementById('summaryStatus').textContent = call.status || 'Unknown';
-        }
-        
-        function closePanel() {
-            document.getElementById('sidePanel').classList.remove('open');
-            selectedCallSid = null;
-            if (refreshInterval) {
-                clearInterval(refreshInterval);
-                refreshInterval = null;
-            }
-        }
-        
-        loadData();
-        setInterval(loadData, 30000);
-    </script>
-</body>
-</html>
-'''
-
-DASHBOARD_FULL = '''
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Voice Agent Dashboard - WasteKing</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        
-        .header {
-            background: white;
-            padding: 30px;
-            border-radius: 15px;
-            margin-bottom: 25px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.15);
-            position: relative;
-        }
-        
-        .logo-container {
-            position: absolute;
-            top: 20px;
-            right: 30px;
-            display: flex;
-            align-items: center;
-            gap: 15px;
-        }
-        
-        .logo-box {
-            width: 50px;
-            height: 50px;
-            background: #e53e3e;
-            border-radius: 8px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            font-weight: 900;
-            font-size: 18px;
-        }
-        
-        .header h1 { font-size: 28px; color: #333; margin-bottom: 5px; }
-        
+        h1 { color: #333; font-size: 2rem; margin-bottom: 20px; }
         .search-container {
+            margin-bottom: 20px;
             display: flex;
             gap: 10px;
-            margin-top: 20px;
         }
-        
         .search-input {
             flex: 1;
             padding: 12px 16px;
             border: 2px solid #dee2e6;
             border-radius: 25px;
-            font-size: 14px;
-            outline: none;
+            font-size: 1rem;
         }
-        
-        .search-btn, .clear-btn {
-            padding: 12px 24px;
-            border-radius: 25px;
+        .search-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
             border: none;
+            padding: 12px 20px;
+            border-radius: 25px;
             cursor: pointer;
             font-weight: 600;
         }
-        
-        .search-btn { background: #667eea; color: white; }
-        .clear-btn { background: #f8f9fa; color: #666; }
-        
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-            margin-bottom: 25px;
-        }
-        
-        .stat-card {
+        .calls-table {
             background: white;
-            padding: 25px;
-            border-radius: 12px;
-            text-align: center;
-            box-shadow: 0 8px 20px rgba(0,0,0,0.1);
-        }
-        
-        .stat-number { font-size: 36px; font-weight: bold; color: #667eea; }
-        .stat-label { font-size: 14px; color: #666; margin-top: 5px; }
-        
-        .calls-list {
-            background: white;
-            border-radius: 15px;
+            border-radius: 10px;
             overflow: hidden;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
         }
-        
-        .call-item {
-            padding: 20px;
-            border-bottom: 1px solid #f0f0f0;
+        .call-group {
+            border-bottom: 2px solid #e9ecef;
+            transition: all 0.3s ease;
+        }
+        .call-group:nth-child(odd) { background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%); }
+        .call-group:nth-child(even) { background: linear-gradient(135deg, #e3f2fd 0%, #bbdefb 100%); }
+        .call-summary-row {
+            display: flex;
+            align-items: center;
+            padding: 15px 20px;
             cursor: pointer;
-            transition: all 0.3s;
         }
-        
-        .call-item:hover { background: #f8f9fa; }
-        
-        .call-header {
+        .expand-icon {
+            font-size: 1.2rem;
+            margin-right: 15px;
+            transition: transform 0.3s ease;
+            color: #667eea;
+            font-weight: bold;
+        }
+        .call-group.expanded .expand-icon { transform: rotate(90deg); }
+        .call-info {
             display: grid;
-            grid-template-columns: 40px 180px 150px 150px 150px 1fr 100px;
+            grid-template-columns: 120px 150px 200px 150px 150px 1fr 150px;
             gap: 15px;
             align-items: center;
+            flex: 1;
         }
-        
-        .expand-icon {
-            font-size: 20px;
-            color: #667eea;
-            transition: transform 0.3s;
-        }
-        
-        .call-item.expanded .expand-icon { transform: rotate(90deg); }
-        
-        .call-id {
-            font-family: 'Courier New', monospace;
-            font-weight: bold;
-            color: #333;
-        }
-        
-        .status-badge {
-            padding: 4px 12px;
-            border-radius: 15px;
-            font-size: 10px;
-            font-weight: bold;
-            text-transform: uppercase;
-            display: inline-block;
-        }
-        
-        .status-completed { background: #38a169; color: white; }
-        
         .call-details {
             display: none;
             padding: 20px;
-            background: #f8f9fa;
-            margin-top: 15px;
-            border-radius: 10px;
+            background: rgba(255,255,255,0.9);
+            border-top: 1px solid #dee2e6;
         }
-        
-        .call-item.expanded .call-details { display: block; }
-        
-        .detail-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-            margin-bottom: 20px;
-        }
-        
-        .detail-section {
-            background: white;
-            padding: 15px;
-            border-radius: 8px;
-        }
-        
-        .detail-label {
-            font-size: 12px;
-            font-weight: 600;
-            color: #666;
-            margin-bottom: 5px;
-        }
-        
-        .detail-value {
-            font-size: 14px;
-            color: #333;
-            font-weight: 500;
-        }
-        
-        .audio-section {
+        .call-group.expanded .call-details { display: block; }
+        .audio-controls {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
-            padding: 20px;
-            border-radius: 10px;
-            margin: 20px 0;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 15px 0;
         }
-        
-        .try-load-btn {
+        .audio-btn {
             background: rgba(255,255,255,0.2);
             color: white;
             border: 1px solid rgba(255,255,255,0.3);
-            padding: 10px 20px;
+            padding: 8px 15px;
             border-radius: 20px;
             cursor: pointer;
+            margin-right: 10px;
         }
-        
-        .action-buttons {
-            display: flex;
-            gap: 10px;
-            margin-top: 15px;
+        .audio-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .dashboard-link {
+            background: #e53e3e;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: bold;
+            position: absolute;
+            top: 30px;
+            right: 30px;
         }
-        
         .btn {
             padding: 8px 16px;
             border-radius: 6px;
             border: none;
             cursor: pointer;
+            font-size: 0.9rem;
             font-weight: 600;
+            margin-right: 10px;
         }
-        
-        .btn-transcript { background: #667eea; color: white; }
-        .btn-notes { background: #38a169; color: white; }
-        .btn-status { background: #764ba2; color: white; }
+        .btn-notes { background: linear-gradient(135deg, #28a745 0%, #20c997 100%); color: white; }
+        .live-calls-badge {
+            position: absolute;
+            top: 30px;
+            right: 200px;
+            background: #38a169;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-weight: bold;
+        }
     </style>
 </head>
 <body>
-    <div class="header">
-        <div class="logo-container">
-            <div class="logo-box">WK</div>
+    <div class="container">
+        <div class="header">
+            <h1>WasteKing Voice Agent Dashboard</h1>
+            <div class="live-calls-badge" id="liveCalls">Live: 0</div>
+            <a href="/dashboard" class="dashboard-link">Full Dashboard →</a>
+            
+            <div class="search-container">
+                <input type="text" class="search-input" id="searchInput" placeholder="Search by name, phone, postcode...">
+                <button class="search-btn" onclick="performSearch()">Search</button>
+                <button class="search-btn" onclick="clearSearch()" style="background: #6c757d;">Clear</button>
+            </div>
         </div>
         
-        <h1>Voice Agent Dashboard - WasteKing</h1>
-        
-        <div class="search-container">
-            <input type="text" class="search-input" id="searchInput" placeholder="Search by name, phone, postcode, or unique ID...">
-            <button class="search-btn" onclick="performSearch()">Search</button>
-            <button class="clear-btn" onclick="clearSearch()">Clear</button>
+        <div class="calls-table" id="callsContainer">
+            {% for call in calls %}
+            <div class="call-group" data-call-id="{{ call.id }}">
+                <div class="call-summary-row" onclick="toggleCallExpansion({{ call.id }})">
+                    <span class="expand-icon">▶</span>
+                    <div class="call-info">
+                        <div>{{ call.call_sid[-8:] }}</div>
+                        <div>{{ call.start_time }}</div>
+                        <div><strong>{{ call.customer_name or 'Unknown' }}</strong></div>
+                        <div>{{ call.postcode or 'N/A' }}</div>
+                        <div>{{ call.from or 'Unknown' }}</div>
+                        <div>{{ call.service or 'N/A' }}</div>
+                        <div>{{ call.status }}</div>
+                    </div>
+                </div>
+                
+                <div class="call-details">
+                    {% if call.recording_url %}
+                    <div class="audio-controls">
+                        <strong>Call Recording</strong> ({{ call.recording_duration }}s) - Status: {{ call.audio_status }}
+                        <div style="margin-top: 10px;">
+                            <button class="audio-btn" onclick="event.stopPropagation(); playAudio({{ call.id }})">▶ Play</button>
+                            <button class="audio-btn" onclick="event.stopPropagation(); pauseAudio({{ call.id }})" disabled id="pause-{{ call.id }}">⏸ Pause</button>
+                            <button class="audio-btn" onclick="event.stopPropagation(); stopAudio({{ call.id }})" disabled id="stop-{{ call.id }}">⏹ Stop</button>
+                            {% if call.audio_status != 'downloaded' %}
+                            <button class="audio-btn" onclick="event.stopPropagation(); downloadAudio({{ call.id }})">⬇ Download</button>
+                            {% endif %}
+                        </div>
+                        <audio id="audio-{{ call.id }}" style="width: 100%; margin-top: 10px;" controls>
+                            <source src="{{ call.recording_url }}" type="audio/mpeg">
+                        </audio>
+                    </div>
+                    {% else %}
+                    <div class="audio-controls">No recording available yet</div>
+                    {% endif %}
+                    
+                    <div style="margin-top: 15px; padding: 15px; background: #f8f9fa; border-radius: 8px;">
+                        <strong>Team Notes:</strong>
+                        <div style="margin-top: 10px;">{{ call.team_notes or 'No notes yet' }}</div>
+                        <button class="btn btn-notes" onclick="event.stopPropagation(); addTeamNotes({{ call.id }})">Edit Notes</button>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
         </div>
     </div>
     
-    <div class="stats-grid" id="stats"></div>
-    
-    <div class="calls-list" id="callsList"></div>
-
     <script>
-        let allCalls = [];
+        function toggleCallExpansion(callId) {
+            const callGroup = document.querySelector(`[data-call-id="${callId}"]`);
+            callGroup.classList.toggle('expanded');
+        }
         
-        async function loadData() {
+        function playAudio(id) {
+            const audio = document.getElementById(`audio-${id}`);
+            audio.play();
+            document.getElementById(`pause-${id}`).disabled = false;
+            document.getElementById(`stop-${id}`).disabled = false;
+        }
+        
+        function pauseAudio(id) {
+            const audio = document.getElementById(`audio-${id}`);
+            audio.pause();
+        }
+        
+        function stopAudio(id) {
+            const audio = document.getElementById(`audio-${id}`);
+            audio.pause();
+            audio.currentTime = 0;
+            document.getElementById(`pause-${id}`).disabled = true;
+            document.getElementById(`stop-${id}`).disabled = true;
+        }
+        
+        async function downloadAudio(id) {
             try {
-                const [callsRes, statsRes] = await Promise.all([
-                    fetch('/api/conversations'),
-                    fetch('/api/stats')
-                ]);
-                
-                const callsData = await callsRes.json();
-                const statsData = await statsRes.json();
-                
-                allCalls = callsData.calls || [];
-                
-                document.getElementById('stats').innerHTML = `
-                    <div class="stat-card">
-                        <div class="stat-number">296</div>
-                        <div class="stat-label">Total Calls</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number">2</div>
-                        <div class="stat-label">Today's Calls</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number">22</div>
-                        <div class="stat-label">Callbacks</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number">12</div>
-                        <div class="stat-label">Complaints</div>
-                    </div>
-                `;
-                
-                renderCalls();
+                const response = await fetch(`/api/download-audio/${id}`, { method: 'POST' });
+                const data = await response.json();
+                if (data.success) {
+                    alert('Audio downloaded successfully!');
+                    location.reload();
+                }
             } catch (error) {
-                console.error('Error:', error);
+                alert('Failed to download audio');
             }
-        }
-        
-        function renderCalls() {
-            const container = document.getElementById('callsList');
-            container.innerHTML = '';
-            
-            allCalls.forEach(call => {
-                const item = document.createElement('div');
-                item.className = 'call-item';
-                
-                item.innerHTML = `
-                    <div class="call-header" onclick="toggleExpand(this.parentElement)">
-                        <div class="expand-icon">▼</div>
-                        <div class="call-id">${call.unique_call_id}</div>
-                        <div>${call.datetime || 'N/A'}</div>
-                        <div><strong>${call.customer_name || 'Unknown'}</strong></div>
-                        <div><strong>${call.postcode || 'Unknown'}</strong></div>
-                        <div>${call.service || 'Unknown'}</div>
-                        <div><span class="status-badge status-completed">COMPLETED</span></div>
-                    </div>
-                    
-                    <div class="call-details">
-                        <div class="detail-grid">
-                            <div class="detail-section">
-                                <h4 style="margin-bottom: 15px; color: #333;">Customer Information</h4>
-                                <div style="margin-bottom: 10px;">
-                                    <div class="detail-label">Name</div>
-                                    <div class="detail-value">${call.customer_name || 'Unknown'}</div>
-                                </div>
-                                <div style="margin-bottom: 10px;">
-                                    <div class="detail-label">Phone</div>
-                                    <div class="detail-value">${call.from || 'Unknown'}</div>
-                                </div>
-                                <div style="margin-bottom: 10px;">
-                                    <div class="detail-label">Email</div>
-                                    <div class="detail-value">${call.customer_email || 'Not provided'}</div>
-                                </div>
-                                <div style="margin-bottom: 10px;">
-                                    <div class="detail-label">Address</div>
-                                    <div class="detail-value">${call.customer_address || 'Not provided'}</div>
-                                </div>
-                                <div>
-                                    <div class="detail-label">Postcode</div>
-                                    <div class="detail-value">${call.postcode || 'Unknown'}</div>
-                                </div>
-                            </div>
-                            
-                            <div class="detail-section">
-                                <h4 style="margin-bottom: 15px; color: #333;">Service Details</h4>
-                                <div style="margin-bottom: 10px;">
-                                    <div class="detail-label">Product</div>
-                                    <div class="detail-value">${call.service || 'Unknown'}</div>
-                                </div>
-                                <div style="margin-bottom: 10px;">
-                                    <div class="detail-label">Supplements</div>
-                                    <div class="detail-value">None</div>
-                                </div>
-                                <div style="margin-bottom: 10px;">
-                                    <div class="detail-label">Action</div>
-                                    <div class="detail-value">Jennifer forwarded to advisor</div>
-                                </div>
-                                <div>
-                                    <div class="detail-label">Duration</div>
-                                    <div class="detail-value">7 seconds</div>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <div style="background: #fff3cd; padding: 15px; border-radius: 8px; border-left: 4px solid #ff9800; margin-bottom: 20px;">
-                            <div style="font-weight: 600; margin-bottom: 8px;">Call Summary</div>
-                            <div>AI extraction unavailable</div>
-                        </div>
-                        
-                        <div class="audio-section">
-                            <h3>📞 Call Recording</h3>
-                            <div style="margin-top: 10px; font-size: 14px; opacity: 0.9;">Checking for audio recording...</div>
-                            <button class="try-load-btn" style="margin-top: 15px;">🔍 Try Load Audio</button>
-                        </div>
-                        
-                        <div style="margin-top: 20px;">
-                            <h4 style="margin-bottom: 10px;">Transcript Preview</h4>
-                            <div style="background: white; padding: 15px; border-radius: 8px;">
-                                AI extraction unavailable
-                            </div>
-                        </div>
-                        
-                        <div class="action-buttons">
-                            <button class="btn btn-transcript">Full Transcript</button>
-                            <button class="btn btn-notes">Edit Notes</button>
-                            <button class="btn btn-status">Update Status</button>
-                        </div>
-                    </div>
-                `;
-                
-                container.appendChild(item);
-            });
-        }
-        
-        function toggleExpand(item) {
-            item.classList.toggle('expanded');
         }
         
         async function performSearch() {
             const query = document.getElementById('searchInput').value;
             if (!query) return;
             
-            try {
-                const response = await fetch(`/api/search-calls?q=${encodeURIComponent(query)}`);
-                const data = await response.json();
-                allCalls = data.calls || [];
-                renderCalls();
-            } catch (error) {
-                console.error('Search error:', error);
-            }
+            const response = await fetch(`/api/search-calls?q=${encodeURIComponent(query)}`);
+            const data = await response.json();
+            // Update UI with search results
+            console.log(data);
         }
         
         function clearSearch() {
             document.getElementById('searchInput').value = '';
-            loadData();
+            location.reload();
         }
         
-        loadData();
-        setInterval(loadData, 30000);
+        function addTeamNotes(id) {
+            const notes = prompt('Enter team notes:');
+            if (notes !== null) {
+                fetch('/api/update-team-notes', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({call_id: id, team_notes: notes})
+                }).then(() => location.reload());
+            }
+        }
+        
+        async function loadLiveCalls() {
+            try {
+                const response = await fetch('/api/live-calls');
+                const data = await response.json();
+                document.getElementById('liveCalls').textContent = `Live: ${data.count || 0}`;
+            } catch (error) {
+                console.error('Error loading live calls:', error);
+            }
+        }
+        
+        loadLiveCalls();
+        setInterval(loadLiveCalls, 5000);
     </script>
 </body>
 </html>
-'''
+    ''', calls=calls_data)
+
+# DASHBOARD 2: Full Dashboard - /dashboard route
+@app.route('/dashboard')
+def dashboard():
+    return render_template_string('''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WasteKing Voice Agent - Full Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {  
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        .header {
+            background: white;
+            padding: 30px;
+            border-radius: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+        }
+        h1 { font-size: 32px; font-weight: 600; margin-bottom: 20px; }
+        .tabs { display: flex; gap: 10px; flex-wrap: wrap; }
+        .tab {
+            padding: 12px 20px;
+            background: #f0f0f0;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: 500;
+        }
+        .tab.active { background: #e53e3e; color: white; }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .stat-card {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            text-align: center;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+        }
+        .stat-number { font-size: 36px; font-weight: bold; color: #e53e3e; }
+        .dashboard-content {
+            background: white;
+            border-radius: 20px;
+            overflow: hidden;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+        }
+        .table-header {
+            background: linear-gradient(135deg, #e53e3e, #c53030);
+            color: white;
+            padding: 20px;
+            display: grid;
+            grid-template-columns: 80px 150px 120px 150px 150px 100px 80px 120px;
+            gap: 15px;
+            font-weight: 600;
+            font-size: 12px;
+        }
+        .call-row {
+            padding: 20px;
+            display: grid;
+            grid-template-columns: 80px 150px 120px 150px 150px 100px 80px 120px;
+            gap: 15px;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        .call-row:hover { background: #fef5f5; }
+        .btn-details {
+            background: #e53e3e;
+            color: white;
+            padding: 6px 12px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+        .live-link {
+            background: #38a169;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 600;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <h1>WasteKing Voice Agent - Full Dashboard</h1>
+                    <div class="tabs">
+                        <div class="tab active" onclick="setActiveTab('all', this)">All Calls</div>
+                        <div class="tab" onclick="setActiveTab('skip-hire', this)">Skip Hire</div>
+                        <div class="tab" onclick="setActiveTab('man-van', this)">Man & Van</div>
+                        <div class="tab" onclick="setActiveTab('trade', this)">Trade</div>
+                        <div class="tab" onclick="setActiveTab('callbacks', this)">Callbacks</div>
+                    </div>
+                </div>
+                <a href="/" class="live-link">← Main Dashboard</a>
+            </div>
+        </div>
+        
+        <div class="stats-grid">
+            <div class="stat-card"><div class="stat-number" id="totalCalls">0</div><div>Total Calls</div></div>
+            <div class="stat-card"><div class="stat-number" id="skipHireCalls">0</div><div>Skip Hire Calls</div></div>
+            <div class="stat-card"><div class="stat-number" id="tradeCalls">0</div><div>Trade Customers</div></div>
+            <div class="stat-card"><div class="stat-number" id="activeCalls">0</div><div>Active Calls</div></div>
+        </div>
+        
+        <div class="dashboard-content">
+            <div class="table-header">
+                <div>TIME</div><div>CUSTOMER</div><div>POSTCODE</div><div>PHONE</div><div>SERVICE</div><div>STATUS</div><div>MSGS</div><div>ACTIONS</div>
+            </div>
+            <div id="callsTable"></div>
+        </div>
+    </div>
+
+    <script>
+        let allCalls = [];
+        let currentFilter = 'all';
+
+        function setActiveTab(filter, element) {
+            document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+            element.classList.add('active');
+            currentFilter = filter;
+            renderFilteredCalls();
+        }
+
+        function filterCalls(calls, filter) {
+            switch(filter) {
+                case 'all': return calls;
+                case 'skip-hire': return calls.filter(call => call.service === 'Skip Hire');
+                case 'man-van': return calls.filter(call => call.service === 'Man & Van');
+                case 'trade': return calls.filter(call => call.trade_customer === true);
+                case 'callbacks': return calls.filter(call => call.callback_requested === true);
+                default: return calls;
+            }
+        }
+
+        function renderFilteredCalls() {
+            const container = document.getElementById('callsTable');
+            container.innerHTML = '';
+            
+            const filteredCalls = filterCalls(allCalls, currentFilter);
+            
+            filteredCalls.forEach(call => {
+                const row = document.createElement('div');
+                row.className = 'call-row';
+                
+                const time = new Date(call.start_time).toLocaleTimeString('en-GB', {
+                    hour: '2-digit', 
+                    minute: '2-digit'
+                });
+                
+                row.innerHTML = `
+                    <div>${time}</div>
+                    <div><strong>${call.customer_name || 'Unknown'}</strong></div>
+                    <div>${call.postcode || 'N/A'}</div>
+                    <div>${call.from || 'Unknown'}</div>
+                    <div>${call.service || 'Unknown'}</div>
+                    <div>${call.status}</div>
+                    <div>${call.transcript_count}</div>
+                    <div><button class="btn-details">Details</button></div>
+                `;
+                
+                container.appendChild(row);
+            });
+        }
+        
+        async function fetchAllData() {
+            try {
+                const response = await fetch('/api/conversations');
+                const data = await response.json();
+                allCalls = data.calls;
+                
+                document.getElementById('totalCalls').textContent = allCalls.length;
+                document.getElementById('skipHireCalls').textContent = allCalls.filter(c => c.service === 'Skip Hire').length;
+                document.getElementById('tradeCalls').textContent = allCalls.filter(c => c.trade_customer).length;
+                document.getElementById('activeCalls').textContent = allCalls.filter(c => c.status === 'active').length;
+
+                renderFilteredCalls();
+            } catch (error) {
+                console.error('Error:', error);
+            }
+        }
+
+        fetchAllData();
+        setInterval(fetchAllData, 3000);
+    </script>
+</body>
+</html>
+    ''')
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
-    print("="*60)
-    print("WasteKing Voice Agent - Two Dashboards")
-    print("="*60)
-    print(f"Simple Dashboard (with side panel): http://localhost:{port}/")
-    print(f"Full Dashboard (expandable rows): http://localhost:{port}/dashboard")
-    print("="*60)
-    print("Features:")
-    print("✓ Live audio listening for active calls")
-    print("✓ Call recording playback")
-    print("✓ Real-time transcripts")
-    print("✓ Search functionality")
-    print("✓ Team notes editing")
-    print("✓ Status updates")
-    print("="*60)
-    app.run(host='0.0.0.0', port=port, debug=False)
+    print(f"Server running on port {port}")
+    print(f"Main Dashboard: http://localhost:{port}/")
+    print(f"Full Dashboard: http://localhost:{port}/dashboard")
+    print("Features: OpenAI extraction, Audio download, Team notes, Search, Live call tracking")
+    app.run(host='0.0.0.0', port=port)
