@@ -374,29 +374,19 @@ def handle_incoming_call():
 @with_db_retry
 def handle_recording():
     call_sid = request.form.get('CallSid')
-    recording_url = request.form.get('RecordingUrl')
     recording_sid = request.form.get('RecordingSid')
     recording_duration = request.form.get('RecordingDuration', 0)
     
     try:
         call = Call.query.filter_by(call_sid=call_sid).first()
-        if call:
-            # Convert to public media URL (no authentication required)
-            if recording_url:
-                # Remove .json extension and add .mp3
-                if '.json' in recording_url:
-                    recording_url = recording_url.replace('.json', '')
-                if not recording_url.endswith('.mp3'):
-                    recording_url = recording_url + '.mp3'
-            
-            call.recording_url = recording_url
+        if call and recording_sid and TWILIO_ACCOUNT_SID != 'your_twilio_sid':
+            # PUBLIC URL - NO PASSWORD
+            call.recording_url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Recordings/{recording_sid}.mp3"
             call.recording_sid = recording_sid
             call.recording_duration = int(recording_duration)
             call.audio_status = 'available'
             db.session.commit()
-            print(f"Recording saved: {recording_url}")
-    except Exception as e:
-        print(f"Recording save error: {e}")
+    except:
         db.session.rollback()
     
     return "OK", 200
@@ -1399,7 +1389,7 @@ def dashboard():
                     <div>${call.service || 'Unknown'}</div>
                     <div>${call.status}</div>
                     <div>${call.transcript_count}</div>
-                    <div><button class="btn-details" onclick="window.location.href='/'">Details</button></div>
+                    <div><button class="btn-details">Details</button></div>
                 `;
                 
                 container.appendChild(row);
