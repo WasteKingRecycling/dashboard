@@ -98,14 +98,20 @@ class Call(db.Model):
     transcripts = db.relationship('Transcript', backref='call', lazy=True, cascade='all, delete-orphan')
     
     def to_dict(self):
+        transcripts_data = [t.to_dict() for t in self.transcripts]
+        
         return {
             'id': self.id,
             'call_sid': self.call_sid,
             'from': self.from_number,
             'start_time': self.start_time.isoformat() if self.start_time else None,
+            'timestamp': (self.start_time + timedelta(hours=1)).strftime('%d/%m/%Y %H:%M:%S') if self.start_time else None,
             'status': self.status,
             'transcript_count': len(self.transcripts),
             'customer_name': self.customer_name,
+            'phone': self.from_number,
+            'email': self.customer_email,
+            'address': self.customer_address,
             'postcode': self.postcode,
             'service': self.service,
             'trade_customer': self.trade_customer,
@@ -118,7 +124,18 @@ class Call(db.Model):
             'team_notes': self.team_notes,
             'skip_size': self.skip_size,
             'waste_type': self.waste_type,
+            'placement_location': self.placement_location,
+            'delivery_date': self.delivery_date,
+            'time_preference': self.time_preference,
+            'skip_price': self.skip_price,
             'booking_confirmed': self.booking_confirmed,
+            'yards_requested': self.yards_requested,
+            'supplements': self.supplements,
+            'stairs_access': self.stairs_access,
+            'grab_size': self.grab_size,
+            'material_type': self.material_type,
+            'roadside_reach': self.roadside_reach,
+            'transcript': transcripts_data,
         }
 
 class Transcript(db.Model):
@@ -134,6 +151,8 @@ class Transcript(db.Model):
         return {
             'speaker': self.speaker,
             'text': self.text,
+            'message': self.text,
+            'role': self.speaker.lower() if self.speaker else 'unknown',
             'timestamp': self.timestamp.isoformat() if self.timestamp else None,
             'time': self.timestamp.strftime('%H:%M:%S') if self.timestamp else None
         }
@@ -171,7 +190,6 @@ def cleanup_old_audio_files():
                 if file_time < two_hours_ago:
                     os.remove(filepath)
                     deleted_count += 1
-                    print(f"Deleted old audio file: {filename}")
         
         if deleted_count > 0:
             print(f"Cleanup: Deleted {deleted_count} audio files older than 2 hours")
@@ -183,17 +201,14 @@ def cleanup_old_database_records():
     try:
         three_months_ago = datetime.utcnow() - timedelta(days=90)
         
-        # Delete old transcripts
         old_transcripts = Transcript.query.filter(Transcript.timestamp < three_months_ago).all()
         for transcript in old_transcripts:
             db.session.delete(transcript)
         
-        # Delete old calls
         old_calls = Call.query.filter(Call.start_time < three_months_ago).all()
         for call in old_calls:
             db.session.delete(call)
         
-        # Delete old live calls
         old_live_calls = LiveCall.query.filter(LiveCall.start_time < three_months_ago).all()
         for live_call in old_live_calls:
             db.session.delete(live_call)
@@ -339,7 +354,6 @@ def handle_incoming_call():
             db.session.add(call)
             db.session.commit()
             
-        # Track as live call
         live_call = LiveCall.query.filter_by(call_sid=call_sid).first()
         if not live_call:
             live_call = LiveCall(call_sid=call_sid, phone=from_number, status='connecting')
@@ -418,11 +432,9 @@ def handle_transcription():
                     transcript = Transcript(call_sid=call_sid, speaker=speaker, text=text)
                     db.session.add(transcript)
                     
-                    # Extract info from customer messages
                     if speaker == 'CUSTOMER':
                         extract_information_with_openai(text, call)
                     
-                    # Update live call
                     live_call = LiveCall.query.filter_by(call_sid=call_sid).first()
                     if live_call:
                         live_call.status = 'in_progress'
@@ -456,18 +468,17 @@ def handle_transcription():
 @with_db_retry
 def get_conversations():
     try:
-        # Run cleanup automatically every time conversations are fetched
         import random
-        if random.randint(1, 10) == 1:  # Run cleanup 10% of the time
+        if random.randint(1, 10) == 1:
             cleanup_old_audio_files()
         
-        if random.randint(1, 100) == 1:  # Run database cleanup 1% of the time
+        if random.randint(1, 100) == 1:
             cleanup_old_database_records()
         
-        two_hours_ago = datetime.utcnow() - timedelta(hours=2)
-        calls = Call.query.filter(Call.start_time >= two_hours_ago).order_by(Call.start_time.desc()).all()
+        calls = Call.query.order_by(Call.start_time.desc()).limit(100).all()
         return jsonify({'calls': [call.to_dict() for call in calls]})
-    except:
+    except Exception as e:
+        print(f"Error in get_conversations: {e}")
         return jsonify({'calls': []}), 500
 
 @app.route('/api/conversations/<call_sid>')
@@ -501,7 +512,6 @@ def get_conversation(call_sid):
 @with_db_retry
 def get_live_calls():
     try:
-        # Clean old calls
         old_calls = LiveCall.query.filter(
             LiveCall.last_update < datetime.utcnow() - timedelta(hours=1)
         ).all()
@@ -659,19 +669,16 @@ def get_call_audio(call_id):
 
 @app.route('/api/cleanup/audio', methods=['POST'])
 def cleanup_audio_endpoint():
-    """Manual trigger for audio file cleanup"""
     cleanup_old_audio_files()
     return jsonify({'success': True, 'message': 'Audio files cleanup completed'})
 
 @app.route('/api/cleanup/database', methods=['POST'])
 def cleanup_database_endpoint():
-    """Manual trigger for database cleanup"""
     cleanup_old_database_records()
     return jsonify({'success': True, 'message': 'Database cleanup completed'})
 
 @app.route('/api/cleanup/all', methods=['POST'])
 def cleanup_all_endpoint():
-    """Manual trigger for all cleanup tasks"""
     cleanup_old_audio_files()
     cleanup_old_database_records()
     return jsonify({'success': True, 'message': 'All cleanup tasks completed'})
@@ -679,7 +686,6 @@ def cleanup_all_endpoint():
 @app.route('/api/stats')
 @with_db_retry
 def get_stats():
-    """Get statistics about calls"""
     try:
         total_calls = Call.query.count()
         today_calls = Call.query.filter(
@@ -706,7 +712,7 @@ def get_stats():
             'active_calls': 0
         })
 
-# DASHBOARD 1: Main Dashboard - / route
+# DASHBOARD 1: Main Dashboard - / route (FROM FIRST CODE WITH ALL DETAILS)
 @app.route('/')
 def index():
     try:
@@ -802,6 +808,36 @@ def index():
             border-top: 1px solid #dee2e6;
         }
         .call-group.expanded .call-details { display: block; }
+        
+        .details-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin-bottom: 20px;
+        }
+        
+        .detail-section {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+        }
+        
+        .detail-title {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 10px;
+            border-bottom: 1px solid #dee2e6;
+            padding-bottom: 5px;
+        }
+        
+        .summary-section {
+            grid-column: 1 / -1;
+            background: #fff3e0;
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 4px solid #ff9800;
+        }
+        
         .audio-controls {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
@@ -839,6 +875,7 @@ def index():
             font-weight: 600;
             margin-right: 10px;
         }
+        .btn-details { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
         .btn-notes { background: linear-gradient(135deg, #28a745 0%, #20c997 100%); color: white; }
         .live-calls-badge {
             position: absolute;
@@ -849,6 +886,73 @@ def index():
             padding: 10px 20px;
             border-radius: 8px;
             font-weight: bold;
+        }
+        
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+        }
+        
+        .modal-content {
+            background-color: white;
+            margin: 3% auto;
+            padding: 30px;
+            border-radius: 10px;
+            width: 85%;
+            max-width: 900px;
+            max-height: 85vh;
+            overflow-y: auto;
+        }
+        
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+        }
+        
+        .close {
+            color: #aaa;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        
+        .close:hover { color: #000; }
+        
+        .transcript-preview {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+            max-height: 200px;
+            overflow-y: auto;
+            margin-top: 15px;
+        }
+        
+        .message {
+            margin-bottom: 15px;
+            padding: 15px;
+            border-radius: 12px;
+        }
+        
+        .message.customer {
+            background: #e3f2fd;
+            margin-left: 20px;
+            border-left: 4px solid #2196F3;
+        }
+        
+        .message.ai_agent {
+            background: #e8f5e8;
+            margin-right: 20px;
+            border-left: 4px solid #4caf50;
         }
     </style>
 </head>
@@ -873,16 +977,45 @@ def index():
                     <span class="expand-icon">▶</span>
                     <div class="call-info">
                         <div>{{ call.call_sid[-8:] }}</div>
-                        <div>{{ call.start_time }}</div>
+                        <div>{{ call.timestamp or call.start_time }}</div>
                         <div><strong>{{ call.customer_name or 'Unknown' }}</strong></div>
                         <div>{{ call.postcode or 'N/A' }}</div>
-                        <div>{{ call.from or 'Unknown' }}</div>
+                        <div>{{ call.phone or call.from or 'Unknown' }}</div>
                         <div>{{ call.service or 'N/A' }}</div>
                         <div>{{ call.status }}</div>
                     </div>
                 </div>
                 
                 <div class="call-details">
+                    <div class="details-grid">
+                        <div class="detail-section">
+                            <div class="detail-title">Customer Information</div>
+                            <p><strong>Name:</strong> {{ call.customer_name or 'Unknown' }}</p>
+                            <p><strong>Phone:</strong> {{ call.phone or call.from or 'Unknown' }}</p>
+                            <p><strong>Email:</strong> {{ call.email or 'Not provided' }}</p>
+                            <p><strong>Address:</strong> {{ call.address or 'Not provided' }}</p>
+                            <p><strong>Postcode:</strong> {{ call.postcode or 'Unknown' }}</p>
+                        </div>
+                        
+                        <div class="detail-section">
+                            <div class="detail-title">Service Details</div>
+                            <p><strong>Service:</strong> {{ call.service or 'Unknown' }}</p>
+                            <p><strong>Skip Size:</strong> {{ call.skip_size or 'N/A' }}</p>
+                            <p><strong>Waste Type:</strong> {{ call.waste_type or 'N/A' }}</p>
+                            <p><strong>Duration:</strong> {{ call.recording_duration or 0 }} seconds</p>
+                        </div>
+                    </div>
+                    
+                    <div class="summary-section">
+                        <div class="detail-title">Call Summary</div>
+                        <p>{{ call.customer_name or 'Unknown' }}, a {{ 'trade' if call.trade_customer else 'domestic' }} customer, contacted Waste King for {{ call.service or 'service' }}.</p>
+                        {% if call.team_notes %}
+                            <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #dee2e6;">
+                                <strong>Team Notes:</strong> {{ call.team_notes }}
+                            </div>
+                        {% endif %}
+                    </div>
+                    
                     {% if call.recording_url %}
                     <div class="audio-controls">
                         <strong>Call Recording</strong> ({{ call.recording_duration }}s) - Status: {{ call.audio_status }}
@@ -899,13 +1032,24 @@ def index():
                         </audio>
                     </div>
                     {% else %}
-                    <div class="audio-controls">No recording available yet</div>
+                    <div class="audio-controls">
+                        <strong>📞 Call Recording</strong>
+                        <div style="margin-top: 10px;">Checking for audio recording...</div>
+                        <button class="audio-btn" onclick="event.stopPropagation(); tryLoadAudio({{ call.id }})">🔍 Try Load Audio</button>
+                    </div>
                     {% endif %}
                     
-                    <div style="margin-top: 15px; padding: 15px; background: #f8f9fa; border-radius: 8px;">
-                        <strong>Team Notes:</strong>
-                        <div style="margin-top: 10px;">{{ call.team_notes or 'No notes yet' }}</div>
+                    <div class="transcript-preview">
+                        <div class="detail-title">Transcript Preview</div>
+                        <div id="transcript-preview-{{ call.id }}" style="max-height: 150px; overflow-y: auto; font-size: 0.9rem;">
+                            Loading transcript...
+                        </div>
+                    </div>
+                    
+                    <div style="margin-top: 15px;">
+                        <button class="btn btn-details" onclick="event.stopPropagation(); showFullDetails({{ call.id }})">Full Transcript</button>
                         <button class="btn btn-notes" onclick="event.stopPropagation(); addTeamNotes({{ call.id }})">Edit Notes</button>
+                        <button class="btn btn-details" onclick="event.stopPropagation(); updateCallStatus({{ call.id }})">Update Status</button>
                     </div>
                 </div>
             </div>
@@ -913,10 +1057,35 @@ def index():
         </div>
     </div>
     
+    <div id="detailsModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Full Call Details & Transcript</h2>
+                <span class="close" onclick="closeModal()">&times;</span>
+            </div>
+            <div id="modalDetails"></div>
+        </div>
+    </div>
+    
     <script>
+        const calls = {{ calls | tojson | safe }};
+        
         function toggleCallExpansion(callId) {
             const callGroup = document.querySelector(`[data-call-id="${callId}"]`);
             callGroup.classList.toggle('expanded');
+            
+            // Load transcript preview
+            const call = calls.find(c => c.id === callId);
+            if (call && call.transcript) {
+                const previewEl = document.getElementById(`transcript-preview-${callId}`);
+                if (call.transcript.length > 0) {
+                    previewEl.innerHTML = call.transcript.slice(0, 3).map(t => 
+                        `<strong>${t.speaker}:</strong> ${t.text}`
+                    ).join('<br><br>');
+                } else {
+                    previewEl.innerHTML = 'No transcript available yet';
+                }
+            }
         }
         
         function playAudio(id) {
@@ -939,6 +1108,20 @@ def index():
             document.getElementById(`stop-${id}`).disabled = true;
         }
         
+        async function tryLoadAudio(id) {
+            try {
+                const response = await fetch(`/api/audio/${id}`);
+                const data = await response.json();
+                if (data.success) {
+                    location.reload();
+                } else {
+                    alert('No audio available yet');
+                }
+            } catch (error) {
+                alert('Failed to load audio');
+            }
+        }
+        
         async function downloadAudio(id) {
             try {
                 const response = await fetch(`/api/download-audio/${id}`, { method: 'POST' });
@@ -952,28 +1135,94 @@ def index():
             }
         }
         
+        function showFullDetails(callId) {
+            const call = calls.find(c => c.id === callId);
+            if (call) {
+                const modal = document.getElementById('detailsModal');
+                const details = document.getElementById('modalDetails');
+                
+                let transcriptHtml = '';
+                if (call.transcript && call.transcript.length > 0) {
+                    transcriptHtml = call.transcript.map(msg => `
+                        <div class="message ${msg.speaker.toLowerCase()}">
+                            <strong>${msg.speaker}</strong>
+                            <span style="float: right; font-size: 12px; opacity: 0.7;">${msg.time || ''}</span>
+                            <div style="clear: both; margin-top: 5px;">${msg.text}</div>
+                        </div>
+                    `).join('');
+                } else {
+                    transcriptHtml = '<p>No transcript available</p>';
+                }
+                
+                details.innerHTML = `
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px;">
+                        <div>
+                            <p><strong>Call ID:</strong> ${call.call_sid.substr(-8)}</p>
+                            <p><strong>Customer:</strong> ${call.customer_name || 'Unknown'}</p>
+                            <p><strong>Phone:</strong> ${call.phone || 'Unknown'}</p>
+                            <p><strong>Email:</strong> ${call.email || 'Not provided'}</p>
+                            <p><strong>Address:</strong> ${call.address || 'Not provided'}</p>
+                            <p><strong>Postcode:</strong> ${call.postcode || 'Unknown'}</p>
+                        </div>
+                        <div>
+                            <p><strong>Service:</strong> ${call.service || 'Unknown'}</p>
+                            <p><strong>Duration:</strong> ${call.recording_duration || 0} seconds</p>
+                            <p><strong>Status:</strong> ${call.status}</p>
+                            <p><strong>Trade Customer:</strong> ${call.trade_customer ? 'Yes' : 'No'}</p>
+                        </div>
+                    </div>
+                    
+                    <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                        <h4>Full Transcript:</h4>
+                        <div style="max-height: 400px; overflow-y: auto;">
+                            ${transcriptHtml}
+                        </div>
+                    </div>
+                `;
+                
+                modal.style.display = 'block';
+            }
+        }
+        
+        function closeModal() {
+            document.getElementById('detailsModal').style.display = 'none';
+        }
+        
         async function performSearch() {
             const query = document.getElementById('searchInput').value;
             if (!query) return;
             
             const response = await fetch(`/api/search-calls?q=${encodeURIComponent(query)}`);
             const data = await response.json();
-            // Update UI with search results
-            console.log(data);
+            if (data.success) {
+                location.href = `/?search=${encodeURIComponent(query)}`;
+            }
         }
         
         function clearSearch() {
             document.getElementById('searchInput').value = '';
-            location.reload();
+            location.href = '/';
         }
         
         function addTeamNotes(id) {
-            const notes = prompt('Enter team notes:');
+            const call = calls.find(c => c.id === id);
+            const notes = prompt('Enter team notes:', call.team_notes || '');
             if (notes !== null) {
                 fetch('/api/update-team-notes', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({call_id: id, team_notes: notes})
+                }).then(() => location.reload());
+            }
+        }
+        
+        function updateCallStatus(id) {
+            const status = prompt('Enter new status (active/ended/completed/callback):');
+            if (status) {
+                fetch('/api/update-call-status', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({call_id: id, status: status})
                 }).then(() => location.reload());
             }
         }
@@ -990,12 +1239,19 @@ def index():
         
         loadLiveCalls();
         setInterval(loadLiveCalls, 5000);
+        
+        window.onclick = function(event) {
+            const modal = document.getElementById('detailsModal');
+            if (event.target == modal) {
+                closeModal();
+            }
+        }
     </script>
 </body>
 </html>
     ''', calls=calls_data)
 
-# DASHBOARD 2: Full Dashboard - /dashboard route
+# DASHBOARD 2: Full Dashboard - /dashboard route (FROM SECOND CODE)
 @app.route('/dashboard')
 def dashboard():
     return render_template_string('''
@@ -1161,11 +1417,11 @@ def dashboard():
                     <div>${time}</div>
                     <div><strong>${call.customer_name || 'Unknown'}</strong></div>
                     <div>${call.postcode || 'N/A'}</div>
-                    <div>${call.from || 'Unknown'}</div>
+                    <div>${call.phone || call.from || 'Unknown'}</div>
                     <div>${call.service || 'Unknown'}</div>
                     <div>${call.status}</div>
                     <div>${call.transcript_count}</div>
-                    <div><button class="btn-details">Details</button></div>
+                    <div><button class="btn-details" onclick="window.location.href='/'">Details</button></div>
                 `;
                 
                 container.appendChild(row);
@@ -1197,8 +1453,6 @@ def dashboard():
     ''')
 
 if __name__ == '__main__':
-    # Run cleanup on startup
-    print("Running cleanup on startup...")
     cleanup_old_audio_files()
     cleanup_old_database_records()
     
@@ -1208,5 +1462,4 @@ if __name__ == '__main__':
     print(f"Full Dashboard: http://localhost:{port}/dashboard")
     print("Features: OpenAI extraction, Audio download, Team notes, Search, Live call tracking")
     print("Cleanup: Audio files > 2 hours, Database records > 3 months")
-    print("Manual cleanup endpoints: POST /api/cleanup/audio, /api/cleanup/database, /api/cleanup/all")
     app.run(host='0.0.0.0', port=port)
